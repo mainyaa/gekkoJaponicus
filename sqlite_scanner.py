@@ -4,11 +4,10 @@
 import sqlite3
 import os
 import pandas as pd
-import js2py
 import datetime
+import pandas.io.sql as psql
 import pytz # timezone ("naive", "aware")
 tz = pytz.utc
-import evolution_bayes
 
 def scan_dbfile(path='./history'):
     files = os.listdir(path)
@@ -19,20 +18,21 @@ def scan_dbfile(path='./history'):
             results.append(fullpath)
     return results
 
-def scan_table(dbname='database.db'):
-    exchange = os.path.basename(dbname).split("_")[0]
+def get_markets(dbname='database.db'):
     conn = sqlite3.connect(dbname)
-    c = conn.cursor()
 
-    select_table = '''SELECT name FROM sqlite_master WHERE type='table' '''
-    results = []
-    for table in c.execute(select_table):
-        parts = table[0].split('_')
-        first = parts[0]
-        if first == 'candles':
-            results.append([dbname, table[0], exchange, parts[1], parts[-1]])
-    conn.close()
-    return results
+    select_table = '''SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'candles%' '''
+    df = psql.read_sql_query(select_table, conn)
+    name = df.name.str.split('_', expand=True)
+    name["name"] = df["name"]
+    exchange = os.path.basename(dbname).split("_")[0]
+    name["exchange"] = exchange
+    name["dbname"] = os.path.basename(dbname)
+    name.columns = ["candles", "currency", "assets", "name", "exchange", "dbname"]
+    df = df.merge(name)
+    df = df.drop("candles", axis=1)
+    df = df.rename(columns={'name':'table'})
+    return df
 
 def get_candle_range(dbname, tablename, fromdate, todate, what="*"):
     if isinstance(fromdate, datetime.datetime):
@@ -40,31 +40,22 @@ def get_candle_range(dbname, tablename, fromdate, todate, what="*"):
     if isinstance(todate, datetime.datetime):
         todate = int(todate.timestamp())
     sql = """
-      SELECT {} from {}
+      SELECT {what} from {tablename}
       WHERE start <= ? AND start >= ?
       ORDER BY start ASC
-    """.format(what, tablename)
-    conn = sqlite3.connect(dbname)
-    c = conn.cursor()
-    results = []
-    params = (todate, fromdate)
-    for row in c.execute(sql, params):
-        results.append(row)
-    conn.close()
-    return results
+    """.format(what=what, tablename=tablename)
+    conn = sqlite3.connect(dbname, params=[fromdate, todate])
+    df = psql.read_sql_query(sql, conn)
+    return df
 
 def get_candle(dbname, tablename, what="*"):
     sql = """
-      SELECT {} from {}
+      SELECT {what} from {tablename}
       ORDER BY start ASC
-    """.format(what, tablename)
+    """.format(what=what, tablename=tablename)
     conn = sqlite3.connect(dbname)
-    c = conn.cursor()
-    results = []
-    for row in c.execute(sql):
-        results.append(row)
-    conn.close()
-    return results
+    df = psql.read_sql_query(sql, conn)
+    return df
 
 def get_all_candles():
     files = scan_dbfile('../gekko/history')
@@ -72,23 +63,21 @@ def get_all_candles():
     columns = ['dbfile', 'table', 'exchange', 'currency', 'assets']
     tables = pd.DataFrame([], columns=columns)
     for f in files:
-        merkets = scan_table(dbname=f)
-        m = pd.DataFrame(merkets, columns=columns)
-        tables = pd.concat([tables, m])
+        markets = get_markets(dbname=f)
+        tables = pd.concat([tables, markets])
 
     columns = ['id', 'start', 'open', 'high', 'low', 'close', 'vwp', 'volume', 'trades']
     candles = {}
     candles = pd.DataFrame([], columns=columns)
-    for (i, table) in tables.iterrows():
-        tablename = table["table"]
-        try:
-            candle = get_candle(dbname=f, tablename=tablename)
-        except:
-            continue
-        name = os.path.basename(table["dbfile"])
-        m = pd.DataFrame(candle, columns=columns)
-        m["dbname"] = name+"_"+tablename
-        candles = pd.concat([candles, m])
+    for f in files:
+        for (_, table) in tables.iterrows():
+            tablename = table["table"]
+            try:
+                candle = get_candle(dbname=f, tablename=tablename)
+            except:
+                continue
+            candle["table"] = tablename
+            candles = pd.concat([candles, candle])
     candles["start"] = pd.to_datetime(candles["start"], unit='s')
     candles.index = candles["start"]
     return candles
